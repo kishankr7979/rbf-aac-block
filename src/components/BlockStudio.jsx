@@ -1,326 +1,396 @@
-import { useState, useRef, useCallback } from 'react'
-import { motion, useInView } from 'framer-motion'
-import { Calculator, RefreshCw, ArrowRight, Layers, Weight, Box, Hammer } from 'lucide-react'
-import { calculateBlocks, BLOCK_SIZES } from '../lib/blockCalculator'
+import { useRef, useState } from 'react'
+import { motion } from 'framer-motion'
+import { Calculator, Phone } from 'lucide-react'
+import { calculateBlocks, BLOCK_SIZES, BRICK_EQUIVALENT } from '../lib/blockCalculator'
 
-const THICKNESSES = [75, 100, 150, 200]
-const UNITS = ['ft', 'm']
+const THICKNESSES = Object.keys(BLOCK_SIZES)
+const FT = 0.3048
 
-// Live wall preview using SVG
-function WallPreview({ length, height, thickness }) {
-  const blockW = 60  // px per block (600mm)
-  const blockH = 20  // px per block (200mm)
-  const maxW = 480
-  const maxH = 220
+const clamp = (v, min, max) => Math.min(max, Math.max(min, v))
+const round05 = (v) => Math.round(v / 0.05) * 0.05
+const toMeters = (v, unit) => (parseFloat(v) || 0) * (unit === 'ft' ? FT : 1)
+const fromMeters = (m, unit) => (unit === 'ft' ? m / FT : m)
+const fmt = (n, d = 2) => Number(n.toFixed(d)).toString()
 
-  const lengthM = parseFloat(length) || 0
-  const heightM = parseFloat(height) || 0
+/* ---------------- Isometric block preview ---------------- */
+
+function IsoBlock({ thickness }) {
+  const t = parseInt(thickness, 10)
+  const d = 12 + ((t - 100) / 150) * 30 // 12px (100mm) .. 42px (250mm)
+  const dx = d * 0.9
+  const dy = d * 0.55
+  const fx = 54
+  const fy = 66
+  const fw = 118
+  const fh = 44
+  const pores = [
+    [58, 80], [90, 88], [120, 76], [148, 92], [74, 100], [108, 102], [140, 80],
+  ]
+  return (
+    <svg viewBox="0 0 250 150" className="w-full h-auto" role="img" aria-label={`AAC block, 600 x 200 x ${t} mm`}>
+      <polygon
+        points={`${fx},${fy} ${fx + dx},${fy - dy} ${fx + fw + dx},${fy - dy} ${fx + fw},${fy}`}
+        fill="#eef2f8" stroke="#b9c6da" strokeWidth="1.2"
+      />
+      <polygon
+        points={`${fx + fw},${fy} ${fx + fw + dx},${fy - dy} ${fx + fw + dx},${fy + fh - dy} ${fx + fw},${fy + fh}`}
+        fill="#dfe7f1" stroke="#b9c6da" strokeWidth="1.2"
+      />
+      <rect x={fx} y={fy} width={fw} height={fh} rx="2" fill="#f7fafd" stroke="#b9c6da" strokeWidth="1.2" />
+      {pores.map(([cx, cy], i) => (
+        <circle key={i} cx={cx} cy={cy} r="2.4" fill="#ccd7e6" />
+      ))}
+      <text x={fx + fw / 2} y={fy + fh + 18} textAnchor="middle" fontSize="11" fontFamily="Inter, sans-serif" className="fill-slate-500">600 mm</text>
+      <text x={fx - 8} y={fy + fh / 2 + 4} textAnchor="end" fontSize="11" fontFamily="Inter, sans-serif" className="fill-slate-500">200 mm</text>
+      <text x={fx + fw + dx / 2 + 8} y={fy - dy / 2 + 4} fontSize="11" fontWeight="600" fontFamily="Inter, sans-serif" className="fill-brand-700">{t} mm</text>
+    </svg>
+  )
+}
+
+/* ---------------- Interactive wall canvas ---------------- */
+
+const VB_W = 640
+const VB_H = 340
+const PAD = { l: 52, r: 24, t: 26, b: 46 }
+
+function WallCanvas({ lengthM, heightM, onResize }) {
+  const svgRef = useRef(null)
+  const dragRef = useRef(null)
+  const dimsRef = useRef({ lengthM, heightM, scale: 0 })
+  const [dragging, setDragging] = useState(null)
 
   if (lengthM <= 0 || heightM <= 0) {
     return (
-      <div className="flex items-center justify-center h-full text-slate-600 text-sm">
-        Enter dimensions to see preview
+      <div className="flex items-center justify-center h-64 rounded-lg bg-brand-50 border border-brand-100 text-slate-400 text-sm">
+        Enter wall dimensions to build the wall
       </div>
     )
   }
 
-  // Scale to fit
-  const blocksX = Math.max(1, Math.round(lengthM / 0.6))
-  const blocksY = Math.max(1, Math.round(heightM / 0.2))
+  const availW = VB_W - PAD.l - PAD.r
+  const availH = VB_H - PAD.t - PAD.b
+  const cols = clamp(Math.ceil(lengthM / 0.6 - 1e-9), 1, 60)
+  const rows = clamp(Math.ceil(heightM / 0.2 - 1e-9), 1, 40)
+  const scale = Math.min(availW / lengthM, availH / heightM, 110)
+  const wallW = lengthM * scale
+  const wallH = heightM * scale
+  const ox = PAD.l
+  const oy = VB_H - PAD.b
+  const bw = 0.6 * scale
+  const bh = 0.2 * scale
+  dimsRef.current = { lengthM, heightM, scale }
 
-  const totalW = blocksX * blockW
-  const totalH = blocksY * blockH
+  const clientToVB = (e) => {
+    const rect = svgRef.current.getBoundingClientRect()
+    return {
+      x: ((e.clientX - rect.left) / rect.width) * VB_W,
+      y: ((e.clientY - rect.top) / rect.height) * VB_H,
+    }
+  }
 
-  const scale = Math.min(1, maxW / totalW, maxH / totalH)
-  const scaledBW = blockW * scale
-  const scaledBH = blockH * scale
-  const svgW = Math.min(maxW, totalW * scale) + 2
-  const svgH = Math.min(maxH, totalH * scale) + 2
+  const startDrag = (e, dir) => {
+    e.preventDefault()
+    e.target.setPointerCapture(e.pointerId)
+    dragRef.current = { dir, last: clientToVB(e) }
+    setDragging(dir)
+  }
 
-  const displayBlocksX = Math.min(blocksX, Math.floor(maxW / scaledBW))
-  const displayBlocksY = Math.min(blocksY, Math.floor(maxH / scaledBH))
+  const onMove = (e) => {
+    const d = dragRef.current
+    if (!d) return
+    const p = clientToVB(e)
+    const { lengthM: l, heightM: h, scale: s } = dimsRef.current
+    if (d.dir === 'x') {
+      const next = round05(l + (p.x - d.last.x) / s)
+      onResize(clamp(next, 0.6, 40), null)
+    } else {
+      const next = round05(h - (p.y - d.last.y) / s)
+      onResize(null, clamp(next, 0.2, 10))
+    }
+    d.last = p
+  }
+
+  const endDrag = () => {
+    dragRef.current = null
+    setDragging(null)
+  }
+
+  const blocks = []
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c <= cols; c++) {
+      const x = ox + c * bw + (r % 2 === 1 ? bw / 2 : 0)
+      if (x >= ox + wallW - 0.5) continue
+      const w = Math.min(bw, ox + wallW - x)
+      const y = oy - (r + 1) * bh
+      blocks.push({ x, y, w: Math.max(w - 1, 1), h: bh - 1, r, c })
+    }
+  }
+
+  const rx = ox + wallW // right edge x
+  const ty = oy - wallH // top edge y
 
   return (
-    <div className="relative overflow-hidden rounded-xl bg-slate-900/50 flex items-center justify-center p-2">
-      <svg width={svgW} height={svgH} viewBox={`0 0 ${svgW} ${svgH}`} style={{ maxWidth: '100%' }}>
-        {Array.from({ length: displayBlocksY }).map((_, row) =>
-          Array.from({ length: displayBlocksX }).map((_, col) => {
-            const offset = row % 2 === 0 ? 0 : scaledBW / 2
-            const x = 1 + col * scaledBW + offset
-            const y = 1 + (displayBlocksY - 1 - row) * scaledBH
-            const isPartial = x + scaledBW > svgW - 1
-            const w = Math.min(scaledBW - 1, (svgW - 1) - x)
-            if (w <= 0) return null
-            return (
-              <g key={`${row}-${col}`}>
-                <rect
-                  x={x} y={y} width={w} height={scaledBH - 1}
-                  fill="#1e293b" stroke="#f59e0b" strokeWidth="0.5" rx="1"
-                />
-                {/* Pore circles */}
-                {!isPartial && w > 12 && (
-                  <>
-                    <circle cx={x + w * 0.3} cy={y + scaledBH / 2} r={Math.max(1, scaledBH * 0.2)} fill="#0f172a" opacity="0.7"/>
-                    <circle cx={x + w * 0.7} cy={y + scaledBH / 2} r={Math.max(1, scaledBH * 0.2)} fill="#0f172a" opacity="0.7"/>
-                  </>
-                )}
-              </g>
-            )
-          })
-        )}
+    <div className="relative rounded-lg bg-brand-50 border border-brand-100 p-2">
+      <svg
+        ref={svgRef}
+        viewBox={`0 0 ${VB_W} ${VB_H}`}
+        className="w-full h-auto select-none"
+        style={{ touchAction: 'pan-y' }}
+        role="img"
+        aria-label={`Illustrative wall, ${fmt(lengthM)} metres long and ${fmt(heightM)} metres high, built from ${cols} by ${rows} block courses`}
+      >
+        {/* wall blocks, laid course by course from the bottom */}
+        <g key={`${cols}x${rows}`}>
+          {blocks.map((b) => (
+            <rect
+              key={`${b.r}-${b.c}`}
+              x={b.x}
+              y={b.y}
+              width={b.w}
+              height={b.h}
+              rx="1"
+              fill="#ffffff"
+              stroke="#84aad7"
+              strokeWidth="0.75"
+              style={
+                dragging
+                  ? undefined
+                  : {
+                      animation: 'block-in 0.4s ease both',
+                      animationDelay: `${Math.min(b.r * 55 + b.c * 10, 900)}ms`,
+                    }
+              }
+            />
+          ))}
+        </g>
+
+        {/* dimension lines */}
+        <line x1={ox} y1={oy + 22} x2={ox + wallW} y2={oy + 22} stroke="#94a3b8" strokeWidth="1" strokeDasharray="4 3" />
+        <line x1={ox} y1={oy + 16} x2={ox} y2={oy + 28} stroke="#94a3b8" strokeWidth="1" />
+        <line x1={ox + wallW} y1={oy + 16} x2={ox + wallW} y2={oy + 28} stroke="#94a3b8" strokeWidth="1" />
+        <text x={ox + wallW / 2} y={oy + 38} textAnchor="middle" fontSize="12" fontWeight="600" fontFamily="Inter, sans-serif" className="fill-brand-800">
+          {fmt(lengthM)} m
+        </text>
+        <line x1={ox - 22} y1={oy} x2={ox - 22} y2={oy - wallH} stroke="#94a3b8" strokeWidth="1" strokeDasharray="4 3" />
+        <line x1={ox - 28} y1={oy} x2={ox - 16} y2={oy} stroke="#94a3b8" strokeWidth="1" />
+        <line x1={ox - 28} y1={oy - wallH} x2={ox - 16} y2={oy - wallH} stroke="#94a3b8" strokeWidth="1" />
+        <text
+          x={ox - 32}
+          y={oy - wallH / 2}
+          textAnchor="middle"
+          fontSize="12"
+          fontWeight="600"
+          fontFamily="Inter, sans-serif"
+          className="fill-brand-800"
+          transform={`rotate(-90 ${ox - 32} ${oy - wallH / 2})`}
+        >
+          {fmt(heightM)} m
+        </text>
+
+        {/* drag handle: length (right edge) */}
+        <g
+          data-testid="handle-x"
+          onPointerDown={(e) => startDrag(e, 'x')}
+          onPointerMove={onMove}
+          onPointerUp={endDrag}
+          onPointerCancel={endDrag}
+          style={{ cursor: 'ew-resize', touchAction: 'none' }}
+        >
+          <title>Drag to change wall length</title>
+          <circle cx={rx} cy={oy - wallH / 2} r="36" fill="transparent" />
+          <circle cx={rx} cy={oy - wallH / 2} r="17" fill={dragging === 'x' ? '#ffe8d3' : '#fff5ec'} />
+          <circle cx={rx} cy={oy - wallH / 2} r="11" fill="#ffffff" stroke="#f58220" strokeWidth="2" />
+          <path
+            d={`M ${rx - 4.5} ${oy - wallH / 2} h9 M ${rx + 2.5} ${oy - wallH / 2 - 3} l3 3 l-3 3 M ${rx - 2.5} ${oy - wallH / 2 - 3} l-3 3 l3 3`}
+            stroke="#f58220" strokeWidth="1.5" fill="none" strokeLinecap="round" strokeLinejoin="round"
+          />
+        </g>
+
+        {/* drag handle: height (top edge) */}
+        <g
+          data-testid="handle-y"
+          onPointerDown={(e) => startDrag(e, 'y')}
+          onPointerMove={onMove}
+          onPointerUp={endDrag}
+          onPointerCancel={endDrag}
+          style={{ cursor: 'ns-resize', touchAction: 'none' }}
+        >
+          <title>Drag to change wall height</title>
+          <circle cx={ox + wallW / 2} cy={ty} r="36" fill="transparent" />
+          <circle cx={ox + wallW / 2} cy={ty} r="17" fill={dragging === 'y' ? '#ffe8d3' : '#fff5ec'} />
+          <circle cx={ox + wallW / 2} cy={ty} r="11" fill="#ffffff" stroke="#f58220" strokeWidth="2" />
+          <path
+            d={`M ${ox + wallW / 2} ${ty - 4.5} v9 M ${ox + wallW / 2 - 3} ${ty + 2.5} l3 3 l3 -3 M ${ox + wallW / 2 - 3} ${ty - 2.5} l3 -3 l3 3`}
+            stroke="#f58220" strokeWidth="1.5" fill="none" strokeLinecap="round" strokeLinejoin="round"
+          />
+        </g>
       </svg>
-      {/* Dimension labels */}
-      <div className="absolute bottom-1 right-2 text-xs text-amber-400/70 font-mono">
-        {lengthM}m × {heightM}m
+      <div className="absolute top-2 right-3 text-[11px] text-brand-500 font-medium">
+        {cols} blocks/course x {rows} courses - drag the handles to reshape
       </div>
     </div>
   )
 }
 
-function ResultCard({ icon: Icon, label, value, unit, color }) {
+/* ---------------- Result card ---------------- */
+
+function ResultCard({ label, value, unit }) {
   return (
-    <div className={`bg-white/5 border ${color} rounded-xl p-4 flex items-center gap-3`}>
-      <div className={`w-10 h-10 rounded-lg flex items-center justify-center ${color.replace('border-', 'bg-').replace('/30', '/15')}`}>
-        <Icon className={`w-5 h-5 ${color.replace('border-', 'text-').replace('/30', '')}`} />
+    <div className="rounded-lg border border-slate-200 bg-white p-4 text-center">
+      <div className="font-display font-bold text-2xl text-brand-900">
+        {value}
+        {unit && <span className="text-sm font-medium text-slate-500 ml-1">{unit}</span>}
       </div>
-      <div>
-        <div className="text-xs text-slate-500 mb-0.5">{label}</div>
-        <div className="font-display font-bold text-white text-lg">
-          {value} <span className="text-sm font-normal text-slate-400">{unit}</span>
-        </div>
-      </div>
+      <div className="mt-1 text-xs font-medium text-slate-500 uppercase tracking-wide">{label}</div>
     </div>
   )
 }
+
+/* ---------------- Section ---------------- */
 
 export default function BlockStudio() {
-  const ref = useRef(null)
-  const isInView = useInView(ref, { once: true, margin: '-80px' })
+  const [unit, setUnit] = useState('m')
+  const [length, setLength] = useState('10')
+  const [height, setHeight] = useState('3')
+  const [thickness, setThickness] = useState('150')
+  const [openings, setOpenings] = useState('0')
 
-  const [unit, setUnit] = useState('ft')
-  const [length, setLength] = useState('')
-  const [height, setHeight] = useState('')
-  const [thickness, setThickness] = useState(100)
-  const [openings, setOpenings] = useState('')
+  const result = calculateBlocks({ length, height, thickness, unit, openings })
+  const lengthM = toMeters(length, unit)
+  const heightM = toMeters(height, unit)
+  const bricksReplaced = result ? result.totalBlocks * BRICK_EQUIVALENT[thickness] : null
 
-  const factor = unit === 'ft' ? 0.3048 : 1
-  const lengthM = (parseFloat(length) || 0) * factor
-  const heightM = (parseFloat(height) || 0) * factor
-
-  const result = calculateBlocks({ length: lengthM, height: heightM, thickness, unit: 'm', openings })
-
-  const reset = () => {
-    setLength('')
-    setHeight('')
-    setOpenings('')
-    setThickness(100)
+  const switchUnit = (next) => {
+    if (next === unit) return
+    const conv = (v, f) => {
+      const n = parseFloat(v)
+      return Number.isNaN(n) ? v : fmt(n * f, 2)
+    }
+    const toFt = next === 'ft'
+    setLength((v) => conv(v, toFt ? 1 / FT : FT))
+    setHeight((v) => conv(v, toFt ? 1 / FT : FT))
+    setOpenings((v) => conv(v, toFt ? 10.7639 : 0.09290304))
+    setUnit(next)
   }
 
-  const buildWhatsAppLink = () => {
-    if (!result) return '#'
-    const msg = `Hi RBF AAC Block! I need a quote for:\n- Wall: ${length} ${unit} × ${height} ${unit}\n- Thickness: ${thickness}mm\n- Blocks required: ${result.totalBlocks}\n- Volume: ${result.volumeCBM} m³\nPlease send me pricing details.`
-    return `https://wa.me/918840693544?text=${encodeURIComponent(msg)}`
+  const handleResize = (lenM, hgtM) => {
+    if (lenM != null) setLength(fmt(fromMeters(lenM, unit), 2))
+    if (hgtM != null) setHeight(fmt(fromMeters(hgtM, unit), 2))
   }
+
+  const inputCls =
+    'w-full rounded-lg border border-slate-300 px-3 py-2.5 text-sm text-brand-900 focus:outline-none focus:ring-2 focus:ring-brand-500 focus:border-brand-500'
+  const labelCls = 'block text-sm font-medium text-slate-600 mb-1.5'
 
   return (
-    <section id="studio" ref={ref} className="py-24 bg-[#0d1829] relative overflow-hidden">
-      {/* Background */}
-      <div className="absolute inset-0 grid-pattern opacity-20" />
-      <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[900px] h-[900px] bg-amber-500/5 rounded-full blur-[150px] pointer-events-none" />
-
-      <div className="relative max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        {/* Header */}
-        <motion.div
-          initial={{ opacity: 0, y: 30 }}
-          animate={isInView ? { opacity: 1, y: 0 } : {}}
-          transition={{ duration: 0.6 }}
-          className="text-center mb-14"
-        >
-          <div className="inline-flex items-center gap-2 bg-amber-500/10 border border-amber-500/20 rounded-full px-4 py-2 mb-6">
-            <Calculator className="w-4 h-4 text-amber-400" />
-            <span className="text-amber-400 text-sm font-semibold">Block Configuration Studio</span>
-          </div>
-          <h2 className="section-title mb-4">
-            Calculate Your{' '}
-            <span className="text-gradient">Block Requirements</span>
-          </h2>
-          <p className="section-subtitle max-w-xl mx-auto">
-            Enter your wall dimensions and instantly get accurate block count, volume, and weight estimates. Then request a tailored quote with one click.
+    <section id="calculator" className="py-16 md:py-24">
+      <div className="container-site">
+        <div className="text-center max-w-2xl mx-auto">
+          <span className="section-tag">Plan your order</span>
+          <h2 className="section-title">Visual Wall Builder</h2>
+          <p className="section-subtitle mt-4">
+            Drag the wall edges or enter dimensions, choose a block size, and see the
+            quantity and volume instantly. Includes a 5% site wastage allowance.
           </p>
-        </motion.div>
+        </div>
 
-        {/* Studio Panel */}
         <motion.div
-          initial={{ opacity: 0, y: 40 }}
-          animate={isInView ? { opacity: 1, y: 0 } : {}}
-          transition={{ duration: 0.7, delay: 0.2 }}
-          className="max-w-5xl mx-auto"
+          initial={{ opacity: 0, y: 16 }}
+          whileInView={{ opacity: 1, y: 0 }}
+          viewport={{ once: true, margin: '-60px' }}
+          transition={{ duration: 0.5 }}
+          className="mt-12 card p-6 md:p-8 max-w-6xl mx-auto grid lg:grid-cols-5 gap-8"
         >
-          <div className="bg-slate-900/80 backdrop-blur-xl border border-white/10 rounded-3xl overflow-hidden shadow-2xl shadow-black/40">
-            {/* Studio header bar */}
-            <div className="bg-gradient-to-r from-amber-600 to-amber-500 px-6 py-4 flex items-center justify-between">
-              <div className="flex items-center gap-3">
-                <div className="flex gap-1.5">
-                  <div className="w-3 h-3 rounded-full bg-red-400/80"></div>
-                  <div className="w-3 h-3 rounded-full bg-yellow-400/80"></div>
-                  <div className="w-3 h-3 rounded-full bg-green-400/80"></div>
-                </div>
-                <span className="font-display font-bold text-slate-900 text-sm">RBF Block Studio™</span>
+          {/* Controls */}
+          <div className="lg:col-span-2">
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className={labelCls}>Wall length</label>
+                <input type="number" min="0" step="any" value={length} onChange={(e) => setLength(e.target.value)} className={inputCls} />
               </div>
-              <button onClick={reset} className="flex items-center gap-1.5 bg-slate-900/20 hover:bg-slate-900/30 text-slate-900 text-xs font-semibold px-3 py-1.5 rounded-lg transition-colors">
-                <RefreshCw className="w-3 h-3" />
-                Reset
-              </button>
+              <div>
+                <label className={labelCls}>Wall height</label>
+                <input type="number" min="0" step="any" value={height} onChange={(e) => setHeight(e.target.value)} className={inputCls} />
+              </div>
+              <div>
+                <label className={labelCls}>Unit</label>
+                <select value={unit} onChange={(e) => switchUnit(e.target.value)} className={inputCls}>
+                  <option value="m">Metres</option>
+                  <option value="ft">Feet</option>
+                </select>
+              </div>
+              <div>
+                <label className={labelCls}>Openings (doors/windows, {unit === 'ft' ? 'ft²' : 'm²'})</label>
+                <input type="number" min="0" step="any" value={openings} onChange={(e) => setOpenings(e.target.value)} className={inputCls} />
+              </div>
             </div>
 
-            <div className="p-6 md:p-8">
-              <div className="grid lg:grid-cols-2 gap-8">
-                {/* Left: Inputs */}
-                <div className="space-y-6">
-                  {/* Unit toggle */}
-                  <div>
-                    <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Measurement Unit</label>
-                    <div className="flex bg-slate-800 rounded-xl p-1 w-fit">
-                      {UNITS.map(u => (
-                        <button
-                          key={u}
-                          onClick={() => setUnit(u)}
-                          className={`px-6 py-2 rounded-lg text-sm font-semibold transition-all ${
-                            unit === u
-                              ? 'bg-amber-500 text-slate-900 shadow-md'
-                              : 'text-slate-400 hover:text-white'
-                          }`}
-                        >
-                          {u === 'ft' ? 'Feet (ft)' : 'Metres (m)'}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-
-                  {/* Wall dimensions */}
-                  <div>
-                    <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3">Wall Dimensions</label>
-                    <div className="grid grid-cols-2 gap-4">
-                      <div>
-                        <label className="block text-sm text-slate-300 mb-1.5">Length ({unit})</label>
-                        <input
-                          type="number"
-                          min="0"
-                          step="0.5"
-                          value={length}
-                          onChange={e => setLength(e.target.value)}
-                          placeholder={unit === 'ft' ? 'e.g. 20' : 'e.g. 6'}
-                          className="w-full bg-slate-800 border border-white/10 rounded-xl px-4 py-3 text-white placeholder-slate-600 focus:outline-none focus:border-amber-500/60 focus:ring-1 focus:ring-amber-500/30 transition-all"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-sm text-slate-300 mb-1.5">Height ({unit})</label>
-                        <input
-                          type="number"
-                          min="0"
-                          step="0.5"
-                          value={height}
-                          onChange={e => setHeight(e.target.value)}
-                          placeholder={unit === 'ft' ? 'e.g. 10' : 'e.g. 3'}
-                          className="w-full bg-slate-800 border border-white/10 rounded-xl px-4 py-3 text-white placeholder-slate-600 focus:outline-none focus:border-amber-500/60 focus:ring-1 focus:ring-amber-500/30 transition-all"
-                        />
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Block thickness selector */}
-                  <div>
-                    <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3">Block Thickness</label>
-                    <div className="grid grid-cols-4 gap-2">
-                      {THICKNESSES.map(t => (
-                        <button
-                          key={t}
-                          onClick={() => setThickness(t)}
-                          className={`relative py-3 px-2 rounded-xl border text-center transition-all ${
-                            thickness === t
-                              ? 'border-amber-500 bg-amber-500/15 text-amber-400'
-                              : 'border-white/10 bg-slate-800 text-slate-400 hover:border-white/20'
-                          }`}
-                        >
-                          <div className={`font-bold text-base ${thickness === t ? 'text-amber-400' : 'text-white'}`}>{t}</div>
-                          <div className="text-xs mt-0.5">mm</div>
-                          {thickness === t && (
-                            <div className="absolute -top-1 -right-1 w-3 h-3 bg-amber-500 rounded-full flex items-center justify-center">
-                              <div className="w-1.5 h-1.5 bg-white rounded-full" />
-                            </div>
-                          )}
-                        </button>
-                      ))}
-                    </div>
-                    <p className="text-xs text-slate-500 mt-2 flex items-center gap-1">
-                      <span className="text-amber-400">ℹ</span>
-                      {BLOCK_SIZES[thickness]?.description}
-                    </p>
-                  </div>
-
-                  {/* Openings (optional) */}
-                  <div>
-                    <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1.5">
-                      Openings Area (m²) <span className="text-slate-600 font-normal normal-case">— Optional: doors, windows</span>
-                    </label>
-                    <input
-                      type="number"
-                      min="0"
-                      step="0.1"
-                      value={openings}
-                      onChange={e => setOpenings(e.target.value)}
-                      placeholder="e.g. 2.5"
-                      className="w-full bg-slate-800 border border-white/10 rounded-xl px-4 py-3 text-white placeholder-slate-600 focus:outline-none focus:border-amber-500/60 focus:ring-1 focus:ring-amber-500/30 transition-all"
-                    />
-                  </div>
-                </div>
-
-                {/* Right: Preview + Results */}
-                <div className="space-y-5">
-                  {/* Wall preview */}
-                  <div>
-                    <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Live Wall Preview</label>
-                    <div className="h-48 rounded-xl bg-slate-800/50 border border-white/5 overflow-hidden flex items-center justify-center">
-                      <WallPreview length={lengthM} height={heightM} thickness={thickness} />
-                    </div>
-                  </div>
-
-                  {/* Results */}
-                  {result ? (
-                    <div className="space-y-3">
-                      <div className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Calculation Results</div>
-                      <div className="grid grid-cols-2 gap-3">
-                        <ResultCard icon={Layers} label="Blocks Required" value={result.totalBlocks.toLocaleString('en-IN')} unit="blocks" color="border-amber-500/30" />
-                        <ResultCard icon={Box} label="Volume" value={result.volumeCBM} unit="m³" color="border-blue-500/30" />
-                        <ResultCard icon={Weight} label="Total Weight" value={result.totalWeightKg > 1000 ? result.totalWeightTons : result.totalWeightKg} unit={result.totalWeightKg > 1000 ? 'tons' : 'kg'} color="border-emerald-500/30" />
-                        <ResultCard icon={Hammer} label="Mortar Bags" value={result.mortarBags} unit="bags (approx)" color="border-purple-500/30" />
-                      </div>
-
-                      <div className="bg-amber-500/10 border border-amber-500/20 rounded-xl p-3 text-xs text-amber-300">
-                        <strong className="text-amber-400">Note:</strong> Includes 5% standard wastage factor. Mortar estimate is approximate. Actual requirements may vary.
-                      </div>
-
-                      <a
-                        href={buildWhatsAppLink()}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="flex items-center justify-center gap-2 w-full btn-primary py-3.5 text-sm"
-                      >
-                        <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
-                          <path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"/>
-                        </svg>
-                        Request Quote on WhatsApp
-                        <ArrowRight className="w-4 h-4" />
-                      </a>
-                    </div>
-                  ) : (
-                    <div className="flex flex-col items-center justify-center py-10 text-slate-600">
-                      <Calculator className="w-12 h-12 mb-3 opacity-30" />
-                      <p className="text-sm text-center">Enter wall length and height above<br/>to see your calculation results</p>
-                    </div>
-                  )}
-                </div>
+            <div className="mt-5">
+              <label className={labelCls}>Block size (thickness)</label>
+              <div className="grid grid-cols-3 gap-2">
+                {THICKNESSES.map((t) => (
+                  <button
+                    key={t}
+                    onClick={() => setThickness(t)}
+                    className={`rounded-lg border px-2 py-2.5 text-sm font-medium transition-colors ${
+                      thickness === t
+                        ? 'border-brand-700 bg-brand-800 text-white'
+                        : 'border-slate-300 bg-white text-slate-600 hover:border-brand-400'
+                    }`}
+                  >
+                    {BLOCK_SIZES[t].label.split(' ')[0]}
+                  </button>
+                ))}
               </div>
+              <p className="mt-2 text-xs text-slate-500">
+                {BLOCK_SIZES[thickness].label} - 600 x 200 x {thickness} mm
+              </p>
+            </div>
+
+            <div className="mt-5 rounded-lg border border-slate-200 bg-slate-50 p-4">
+              <IsoBlock thickness={thickness} />
+              <div className="mt-1 flex items-center justify-between text-xs text-slate-500">
+                <span>~{result ? result.blocksPerCBM : '-' } blocks per m³</span>
+                <span>1 block replaces ~{BRICK_EQUIVALENT[thickness]} red bricks</span>
+              </div>
+            </div>
+          </div>
+
+          {/* Builder + estimate */}
+          <div className="lg:col-span-3 flex flex-col gap-6">
+            <WallCanvas lengthM={lengthM} heightM={heightM} onResize={handleResize} />
+
+            <div>
+              <div className="flex items-center gap-2 text-brand-900">
+                <Calculator className="h-5 w-5 text-accent-500" />
+                <h3 className="font-display font-semibold text-lg">Your estimate</h3>
+              </div>
+
+              {result ? (
+                <>
+                  <div className="mt-4 grid grid-cols-2 md:grid-cols-4 gap-4">
+                    <ResultCard label="Blocks needed" value={result.totalBlocks.toLocaleString('en-IN')} />
+                    <ResultCard label="Wall area" value={result.netArea} unit="m²" />
+                    <ResultCard label="Volume" value={result.volumeCBM} unit="m³" />
+                    <ResultCard label="Blocks per m³" value={`~${result.blocksPerCBM}`} />
+                  </div>
+                  <p className="mt-3 text-sm text-slate-600">
+                    Same wall in red bricks: roughly {bricksReplaced.toLocaleString('en-IN')} bricks.
+                  </p>
+                  <p className="mt-2 text-xs text-slate-500 leading-relaxed">
+                    Estimate only. Actual quantity depends on cuts, breakage and site
+                    conditions. Share your requirement with us for an exact quote.
+                  </p>
+                  <a href="tel:+918840693544" className="btn-primary mt-5">
+                    <Phone className="h-5 w-5" />
+                    Get a quote for {result.totalBlocks.toLocaleString('en-IN')} blocks
+                  </a>
+                </>
+              ) : (
+                <p className="mt-4 text-sm text-slate-500">
+                  Enter a valid wall length and height to see the estimate.
+                </p>
+              )}
             </div>
           </div>
         </motion.div>
